@@ -14,6 +14,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from panda3d.core import Vec3
 from p3d_libmap.map_parser import MapParser
 
+ZONE_FORMAT_VERSION = "1.1.0"
+
 
 # ---------------------------------------------------------------------------
 # Data Structures
@@ -32,6 +34,7 @@ class Zone:
     target: str
     fog: str = ""
     adjacent_zones: List[int] = field(default_factory=list)
+    door_waypoint_targets: List[str] = field(default_factory=list)
     brushes: List[ZoneBrush] = field(default_factory=list)
 
 
@@ -175,7 +178,7 @@ def get_aabb_for_brush(brush, epsilon=0.05):
 def write_zones_to_file(zones: List[Zone], output_path: Path):
     """Write all zones to an .nsz file."""
     with output_path.open("w") as f:
-        f.write("zone_file_version: 1.0.0\n")
+        f.write(f"zone_file_version: {ZONE_FORMAT_VERSION}\n")
         f.write(f"number_of_zones: {len(zones)}\n")
 
         for zone in zones:
@@ -192,6 +195,10 @@ def write_zones_to_file(zones: List[Zone], output_path: Path):
             for b in zone.brushes:
                 f.write(f"{b.mins[0]} {b.mins[1]} {b.mins[2]}\n")
                 f.write(f"{b.maxs[0]} {b.maxs[1]} {b.maxs[2]}\n")
+
+            f.write(f"{len(zone.door_waypoint_targets)}\n")
+            for d in zone.door_waypoint_targets:
+                f.write(f"{d}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -221,9 +228,9 @@ def process_map(map_data):
         zone_fog = ent.properties.get("zone_fog", "")
 
         print(f"+ Found a spawn_zone entity:")
-        print(f" - Name:       {zone_name}")
-        print(f" - Target:     {zone_target}")
-        print(f" - Fog:        {zone_fog}")
+        print(f" - Name:         {zone_name}")
+        print(f" - Target:       {zone_target}")
+        print(f" - Fog:          [{zone_fog}]")
 
         # Resolve adjacent zones
         adjacents = ent.properties.get("adjacent_zones", "")
@@ -233,7 +240,15 @@ def process_map(map_data):
             if z.strip()
         ]
 
-        print(f" - Adjacent:   {adjacent_zones}")
+        print(f" - Adjacent:     {adjacent_zones}")
+
+        # Resolve door waypoint targets
+        door_waypoints = ent.properties.get("door_way_targets", "")
+        door_waypoint_targets = [
+            z.strip() for z in door_waypoints.split(",") if z.strip()
+        ]
+
+        print(f" - Door Targets: {door_waypoint_targets}")
 
         # Zone brushes
         brushes = []
@@ -255,6 +270,7 @@ def process_map(map_data):
                 target=zone_target,
                 fog=zone_fog,
                 adjacent_zones=adjacent_zones,
+                door_waypoint_targets=door_waypoint_targets,
                 brushes=brushes,
             )
         )
