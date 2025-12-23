@@ -5,10 +5,13 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import sys
+import math
+import itertools
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from panda3d.core import Vec3
 from p3d_libmap.map_parser import MapParser
 
 ZONE_FORMAT_VERSION = "1.1.0"
@@ -46,23 +49,126 @@ def load_map_without_geo(path: Path):
     return parser.map_data
 
 
-def get_bounds_for_brush(brush, origin=(0.0, 0.0, 0.0)):
-    """Compute min/max bounds for a brush."""
-    ox, oy, oz = origin
+def _vec_sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
 
-    xs, ys, zs = [], [], []
+def _vec_add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
 
+def _vec_dot(a, b):
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+def _vec_cross(a, b):
+    return (
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0],
+    )
+
+def _vec_scale(v, s):
+    return (v[0]*s, v[1]*s, v[2]*s)
+
+def _vec_len(v):
+    return math.sqrt(_vec_dot(v, v))
+
+def _vec_norm(v):
+    l = _vec_len(v)
+    if l == 0.0:
+        return (0.0, 0.0, 0.0)
+    return (v[0]/l, v[1]/l, v[2]/l)
+
+def _plane_from_face(face):
+    # p1, p2, p3 are any 3 points on the plane
+    p1 = (face.plane_points.v0.x, face.plane_points.v0.y, face.plane_points.v0.z)
+    p2 = (face.plane_points.v1.x, face.plane_points.v1.y, face.plane_points.v1.z)
+    p3 = (face.plane_points.v2.x, face.plane_points.v2.y, face.plane_points.v2.z)
+
+    # normal = normalize((p3 - p1) x (p2 - p1))  (matches your format description)
+    n = _vec_cross(_vec_sub(p3, p1), _vec_sub(p2, p1))
+    n = _vec_norm(n)
+
+    # Plane equation: n·x = d
+    d = _vec_dot(n, p1)
+
+    # Half-space rule from your docs:
+    # points p where (p - p1)·n <= 0 are inside
+    # => n·p <= n·p1 == d is inside
+    return n, d
+
+def _intersect_3_planes(p1, p2, p3, eps=1e-9):
+    # Planes: n·x = d
+    (n1, d1) = p1
+    (n2, d2) = p2
+    (n3, d3) = p3
+
+    n2xn3 = _vec_cross(n2, n3)
+    denom = _vec_dot(n1, n2xn3)
+
+    if abs(denom) < eps:
+        return None  # parallel / no single point intersection
+
+    term1 = _vec_scale(n2xn3, d1)
+    term2 = _vec_scale(_vec_cross(n3, n1), d2)
+    term3 = _vec_scale(_vec_cross(n1, n2), d3)
+
+    x = _vec_scale(_vec_add(_vec_add(term1, term2), term3), 1.0 / denom)
+    return x
+
+def get_vertices_for_brush(brush, epsilon=0.05):
+    """
+    Return a list of world-space vertices for a convex Quake brush by intersecting planes.
+    epsilon is in Quake units.
+    """
+    planes = []
     for face in brush.faces:
-        pts = (face.plane_points.v0, face.plane_points.v1, face.plane_points.v2)
-        for p in pts:
-            xs.append(p.x + ox)
-            ys.append(p.y + oy)
-            zs.append(p.z + oz)
+        n, d = _plane_from_face(face)
+        # Skip degenerate faces
+        if _vec_len(n) == 0.0:
+            continue
+        planes.append((n, d))
 
-    if not xs:
+    verts = []
+    for i in range(len(planes)):
+        for j in range(i + 1, len(planes)):
+            for k in range(j + 1, len(planes)):
+                p = _intersect_3_planes(planes[i], planes[j], planes[k])
+                if p is None:
+                    continue
+
+                # Inside test: n·p <= d + epsilon for all planes
+                inside = True
+                for (n, d) in planes:
+                    if _vec_dot(n, p) > d + epsilon:
+                        inside = False
+                        break
+                if not inside:
+                    continue
+
+                # Dedupe near-identical points
+                dup = False
+                for q in verts:
+                    if (abs(p[0] - q[0]) <= epsilon and
+                        abs(p[1] - q[1]) <= epsilon and
+                        abs(p[2] - q[2]) <= epsilon):
+                        dup = True
+                        break
+                if not dup:
+                    verts.append(p)
+
+    return verts
+
+def get_aabb_for_brush(brush, epsilon=0.05):
+    verts = get_vertices_for_brush(brush, epsilon=epsilon)
+    if not verts:
         return None, None
 
-    return (min(xs), min(ys), min(zs)), (max(xs), max(ys), max(zs))
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    zs = [v[2] for v in verts]
+
+    mins = (min(xs), min(ys), min(zs))
+    maxs = (max(xs), max(ys), max(zs))
+    return mins, maxs
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +253,11 @@ def process_map(map_data):
         # Zone brushes
         brushes = []
         for i, brush in enumerate(ent.brushes):
-            mins, maxs = get_bounds_for_brush(brush)
+            mins, maxs = get_aabb_for_brush(brush)
+            if mins is None or maxs is None:
+                print(f"   * Brush {i}: (no points?)")
+                continue
+
             brushes.append(ZoneBrush(mins=mins, maxs=maxs))
             print(f"   * Brush {i}: mins={mins}, maxs={maxs}")
 
